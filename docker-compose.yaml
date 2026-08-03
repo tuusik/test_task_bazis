@@ -1,0 +1,152 @@
+services:
+  postgres:
+    image: postgres:17.9-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-payments}
+      POSTGRES_USER: ${POSTGRES_USER:-payments}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-payments}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  rabbitmq:
+    image: rabbitmq:4.3.4-management
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-payments}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-payments}
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  migrate:
+    build:
+      context: .
+    environment:
+      API_KEY: ${API_KEY:-local-development-api-key}
+      APP_ENV: dev
+      DATABASE_URL: >-
+        postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/${POSTGRES_DB:-payments}
+      RABBITMQ_URL: >-
+        amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-payments}@rabbitmq:5672/
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    init: true
+    restart: "no"
+
+  api:
+    build:
+      context: .
+    environment:
+      API_KEY: ${API_KEY:-local-development-api-key}
+      APP_ENV: dev
+      DATABASE_URL: >-
+        postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/${POSTGRES_DB:-payments}
+    command:
+      [
+        "uvicorn",
+        "app.main:app",
+        "--host", "0.0.0.0",
+        "--port", "8000"
+      ]
+    ports:
+      - "${APP_PORT:-8000}:8000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+  consumer:
+    build:
+      context: .
+    environment:
+      API_KEY: ${API_KEY:-local-development-api-key}
+      APP_ENV: dev
+      DATABASE_URL: >-
+        postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/${POSTGRES_DB:-payments}
+      RABBITMQ_URL: >-
+        amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-payments}@rabbitmq:5672/
+      WEBHOOK_TIMEOUT_SECONDS: ${WEBHOOK_TIMEOUT_SECONDS:-5}
+      WEBHOOK_CLAIM_TTL_SECONDS: ${WEBHOOK_CLAIM_TTL_SECONDS:-30}
+      WEBHOOK_CLAIM_RETRY_SECONDS: ${WEBHOOK_CLAIM_RETRY_SECONDS:-0.5}
+      WEBHOOK_ALLOW_PRIVATE_NETWORKS: ${WEBHOOK_ALLOW_PRIVATE_NETWORKS:-false}
+      CONSUMER_PROCESSING_TIME: ${CONSUMER_PROCESSING_TIME:-[2,5]}
+      CONSUMER_PROCESS_CHANCE: ${CONSUMER_PROCESS_CHANCE:-[90,10]}
+      CONSUMER_RETRY_ATTEMPTS: ${CONSUMER_RETRY_ATTEMPTS:-3}
+      CONSUMER_RETRY_BASE_SECONDS: ${CONSUMER_RETRY_BASE_SECONDS:-1}
+    command:
+      [
+        "faststream",
+        "run",
+        "app.workers.consumer:app"
+      ]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+  outbox-worker:
+    build:
+      context: .
+    environment:
+      API_KEY: ${API_KEY:-local-development-api-key}
+      APP_ENV: dev
+      DATABASE_URL: >-
+        postgresql+asyncpg://${POSTGRES_USER:-payments}:${POSTGRES_PASSWORD:-payments}@postgres:5432/${POSTGRES_DB:-payments}
+      RABBITMQ_URL: >-
+        amqp://${RABBITMQ_USER:-payments}:${RABBITMQ_PASSWORD:-payments}@rabbitmq:5672/
+      OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-1}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-50}
+      OUTBOX_CLAIM_TTL_SECONDS: ${OUTBOX_CLAIM_TTL_SECONDS:-30}
+      OUTBOX_PUBLISH_TIMEOUT_SECONDS: ${OUTBOX_PUBLISH_TIMEOUT_SECONDS:-10}
+      OUTBOX_RETRY_BASE_SECONDS: ${OUTBOX_RETRY_BASE_SECONDS:-1}
+      OUTBOX_MAX_BACKOFF_SECONDS: ${OUTBOX_MAX_BACKOFF_SECONDS:-60}
+    command:
+      [
+        "python",
+        "-m",
+        "app.workers.outbox"
+      ]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    init: true
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
